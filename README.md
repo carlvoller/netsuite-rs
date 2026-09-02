@@ -25,7 +25,7 @@ $ cargo add netsuite-rs
 ### Cargo Feature Flags
 ```toml
 # Cargo.toml
-netsuite-rs = { version = "0.1", features = ["decimal"] }
+netsuite-rs = { version = "1.0.0", features = ["decimal"] }
 ```
 
 - `decimal`: Deserialize numeric cell values into a `bigdecimal::BigDecimal` instead of `f64`. Recommended if you're working with money or need exact precision.
