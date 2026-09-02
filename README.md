@@ -13,7 +13,9 @@ An async lightweight, familiar driver for [Oracle NetSuite](https://www.netsuite
 - [x] Lightweight by design with minimal dependencies
 
 ## Motivation
+I needed a way to connect to Oracle NetSuite in Rust, but couldn't find any existing solution. Figured I would just make this cause why not 🤷‍♂️.
 
+I'm currently actively using this in real production workloads, but thats NOT the same as saying this package has been battle tested. Use at your own risk.
 
 ## Installation
 ```bash
@@ -184,6 +186,9 @@ async fn main() {
 ```
 
 `record_type` is NetSuite's lowercase record type name (`"customer"`, `"salesorder"`, `"inventoryitem"`, etc.) and `fields` follows the JSON shape NetSuite's [Record API](https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_157909163307.html) documents for that record type. Use nested objects for references and sublists, e.g. `{"entity": {"id": "123"}}`.
+
+## Contributing
+PRs are welcomed! Any help is appreciated.
 
 ## License
 Copyright © 2026, Carl Ian Voller.
