@@ -1,3 +1,7 @@
+use std::time::Duration;
+
+use async_io::Timer;
+use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::{
@@ -9,13 +13,14 @@ use crate::{
     error, this_errors,
 };
 
+const CONCURRENCY_LIMIT_ERROR_CODE: &str = "CONCURRENCY_LIMIT_EXCEEDED";
+const MAX_CONCURRENCY_LIMIT_RETRIES: u32 = 5;
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SuiteQlResponse {
     #[serde(default)]
     pub items: Vec<serde_json::Value>,
-    #[serde(default)]
-    pub has_more: bool,
     #[serde(default)]
     pub total_results: i64,
 }
@@ -32,6 +37,16 @@ struct NetsuiteErrorResponse {
     title: Option<String>,
     #[serde(rename = "o:errorDetails", default)]
     error_details: Vec<NetsuiteErrorDetail>,
+}
+
+fn is_concurrency_limit_error(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<NetsuiteErrorResponse>(bytes)
+        .map(|err| {
+            err.error_details
+                .iter()
+                .any(|d| d.error_code.as_deref() == Some(CONCURRENCY_LIMIT_ERROR_CODE))
+        })
+        .unwrap_or(false)
 }
 
 fn parse_error_response(status: reqwest::StatusCode, bytes: &[u8]) -> NetsuiteError {
@@ -80,6 +95,10 @@ impl Connection {
         }
     }
 
+    /// Sends a single signed request, retrying with exponential backoff on NetSuite's
+    /// `CONCURRENCY_LIMIT_EXCEEDED` error when `retry_on_concurrency_limit` is enabled. Returns
+    /// the response's `Location` header (if any) and body bytes on success; any other non-2xx
+    /// response (or a `CONCURRENCY_LIMIT_EXCEEDED` with no retries left) becomes a `NetsuiteError`.
     async fn send(
         &self,
         method: reqwest::Method,
@@ -87,82 +106,75 @@ impl Connection {
         query: &[(String, String)],
         json_body: Option<serde_json::Value>,
         extra_headers: &[(&str, &str)],
-    ) -> Result<reqwest::Response, NetsuiteError> {
-        let base_url = format!("{}{}", self.base_url(), path);
-        let realm = account_id_for_realm(&self.opts().account_id);
-
-        let creds = OAuth1Credentials {
-            consumer_key: &self.opts().consumer_key,
-            consumer_secret: &self.opts().consumer_secret,
-            token_id: &self.opts().token_id,
-            token_secret: &self.opts().token_secret,
-            realm: &realm,
+    ) -> Result<(Option<String>, Bytes), NetsuiteError> {
+        let max_retries = if self.opts().retry_on_concurrency_limit {
+            MAX_CONCURRENCY_LIMIT_RETRIES
+        } else {
+            0
         };
+        let mut attempt = 0u32;
 
-        let auth_header = build_authorization_header(&creds, method.as_str(), &base_url, query)?;
+        loop {
+            let base_url = format!("{}{}", self.base_url(), path);
+            let realm = account_id_for_realm(&self.opts().account_id);
 
-        let mut request = self
-            .client
-            .request(method, &base_url)
-            .query(query)
-            .header("Authorization", auth_header)
-            .header("Content-Type", "application/json");
+            let creds = OAuth1Credentials {
+                consumer_key: &self.opts().consumer_key,
+                consumer_secret: &self.opts().consumer_secret,
+                token_id: &self.opts().token_id,
+                token_secret: &self.opts().token_secret,
+                realm: &realm,
+            };
 
-        for (key, value) in extra_headers {
-            request = request.header(*key, *value);
-        }
+            let auth_header = build_authorization_header(&creds, method.as_str(), &base_url, query)?;
 
-        if let Some(body) = json_body {
-            request = request.json(&body);
-        }
+            let mut request = self
+                .client
+                .request(method.clone(), &base_url)
+                .query(query)
+                .header("Authorization", auth_header)
+                .header("Content-Type", "application/json");
 
-        Ok(this_errors!(
-            "failed to send request to NetSuite",
-            request.send().await
-        ))
-    }
+            for (key, value) in extra_headers {
+                request = request.header(*key, *value);
+            }
 
-    async fn parse_json_or_error<T: serde::de::DeserializeOwned>(
-        &self,
-        response: reqwest::Response,
-    ) -> Result<T, NetsuiteError> {
-        let status = response.status();
-        let bytes = this_errors!(
-            "failed to read NetSuite response body",
-            response.bytes().await
-        );
+            if let Some(body) = &json_body {
+                request = request.json(body);
+            }
 
-        if status.is_success() {
-            Ok(this_errors!(
-                "failed to parse NetSuite response as JSON",
-                serde_json::from_slice::<T>(&bytes)
-            ))
-        } else {
-            Err(parse_error_response(status, &bytes))
-        }
-    }
+            let response = this_errors!(
+                "failed to send request to NetSuite",
+                request.send().await
+            );
 
-    async fn expect_no_content(&self, response: reqwest::Response) -> Result<(), NetsuiteError> {
-        let status = response.status();
-
-        if status.is_success() {
-            Ok(())
-        } else {
+            let status = response.status();
+            let location = response
+                .headers()
+                .get("Location")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             let bytes = this_errors!(
                 "failed to read NetSuite response body",
                 response.bytes().await
             );
-            Err(parse_error_response(status, &bytes))
+
+            if status.is_success() {
+                return Ok((location, bytes));
+            }
+
+            if attempt < max_retries && is_concurrency_limit_error(&bytes) {
+                Timer::after(Duration::from_millis(500 * 2u64.pow(attempt))).await;
+                attempt += 1;
+                continue;
+            }
+
+            return Err(parse_error_response(status, &bytes));
         }
     }
 
-    fn record_id_from_location(response: &reqwest::Response) -> Option<String> {
-        response
-            .headers()
-            .get("Location")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|loc| loc.rsplit('/').next())
-            .map(|s| s.to_string())
+    fn record_id_from_location(location: Option<String>) -> Option<String> {
+        location.and_then(|loc| loc.rsplit('/').next().map(|s| s.to_string()))
     }
 
     pub(crate) async fn suiteql(
@@ -183,7 +195,7 @@ impl Connection {
             body.insert("params".to_string(), serde_json::Value::Array(params));
         }
 
-        let response = self
+        let (_, bytes) = self
             .send(
                 reqwest::Method::POST,
                 "/services/rest/query/v1/suiteql",
@@ -193,7 +205,10 @@ impl Connection {
             )
             .await?;
 
-        let mut response: SuiteQlResponse = self.parse_json_or_error(response).await?;
+        let mut response: SuiteQlResponse = this_errors!(
+            "failed to parse NetSuite response as JSON",
+            serde_json::from_slice(&bytes)
+        );
 
         // NetSuite wraps every row with its own HATEOAS "links" envelope field, regardless of
         // what was selected. Strip it so it's never mistaken for a real SQL column.
@@ -212,22 +227,12 @@ impl Connection {
         fields: serde_json::Value,
     ) -> Result<String, NetsuiteError> {
         let path = format!("/services/rest/record/v1/{record_type}");
-        let response = self
+        let (location, _) = self
             .send(reqwest::Method::POST, &path, &[], Some(fields), &[])
             .await?;
 
-        if response.status().is_success() {
-            Self::record_id_from_location(&response).ok_or_else(|| {
-                error!("NetSuite did not return a Location header for the created record")
-            })
-        } else {
-            let status = response.status();
-            let bytes = this_errors!(
-                "failed to read NetSuite response body",
-                response.bytes().await
-            );
-            Err(parse_error_response(status, &bytes))
-        }
+        Self::record_id_from_location(location)
+            .ok_or_else(|| error!("NetSuite did not return a Location header for the created record"))
     }
 
     pub(crate) async fn record_get(
@@ -236,10 +241,11 @@ impl Connection {
         id: &str,
     ) -> Result<serde_json::Value, NetsuiteError> {
         let path = format!("/services/rest/record/v1/{record_type}/{id}");
-        let response = self
-            .send(reqwest::Method::GET, &path, &[], None, &[])
-            .await?;
-        self.parse_json_or_error(response).await
+        let (_, bytes) = self.send(reqwest::Method::GET, &path, &[], None, &[]).await?;
+        Ok(this_errors!(
+            "failed to parse NetSuite response as JSON",
+            serde_json::from_slice(&bytes)
+        ))
     }
 
     pub(crate) async fn record_update(
@@ -249,10 +255,9 @@ impl Connection {
         fields: serde_json::Value,
     ) -> Result<(), NetsuiteError> {
         let path = format!("/services/rest/record/v1/{record_type}/{id}");
-        let response = self
-            .send(reqwest::Method::PATCH, &path, &[], Some(fields), &[])
+        self.send(reqwest::Method::PATCH, &path, &[], Some(fields), &[])
             .await?;
-        self.expect_no_content(response).await
+        Ok(())
     }
 
     pub(crate) async fn record_replace(
@@ -262,10 +267,9 @@ impl Connection {
         fields: serde_json::Value,
     ) -> Result<(), NetsuiteError> {
         let path = format!("/services/rest/record/v1/{record_type}/{id}");
-        let response = self
-            .send(reqwest::Method::PUT, &path, &[], Some(fields), &[])
+        self.send(reqwest::Method::PUT, &path, &[], Some(fields), &[])
             .await?;
-        self.expect_no_content(response).await
+        Ok(())
     }
 
     pub(crate) async fn record_delete(
@@ -274,10 +278,8 @@ impl Connection {
         id: &str,
     ) -> Result<(), NetsuiteError> {
         let path = format!("/services/rest/record/v1/{record_type}/{id}");
-        let response = self
-            .send(reqwest::Method::DELETE, &path, &[], None, &[])
-            .await?;
-        self.expect_no_content(response).await
+        self.send(reqwest::Method::DELETE, &path, &[], None, &[]).await?;
+        Ok(())
     }
 
     pub(crate) async fn record_upsert(
@@ -287,19 +289,10 @@ impl Connection {
         fields: serde_json::Value,
     ) -> Result<String, NetsuiteError> {
         let path = format!("/services/rest/record/v1/{record_type}/eid:{external_id}");
-        let response = self
+        let (location, _) = self
             .send(reqwest::Method::PUT, &path, &[], Some(fields), &[])
             .await?;
 
-        if response.status().is_success() {
-            Ok(Self::record_id_from_location(&response).unwrap_or_else(|| external_id.to_string()))
-        } else {
-            let status = response.status();
-            let bytes = this_errors!(
-                "failed to read NetSuite response body",
-                response.bytes().await
-            );
-            Err(parse_error_response(status, &bytes))
-        }
+        Ok(Self::record_id_from_location(location).unwrap_or_else(|| external_id.to_string()))
     }
 }

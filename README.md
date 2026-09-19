@@ -3,7 +3,7 @@ An async lightweight, familiar driver for [Oracle NetSuite](https://www.netsuite
 
 ## Features
 - [x] Run SuiteQL queries, with positional bind parameters
-- [x] Stream results, transparently paginating past NetSuite's page size
+- [x] Stream results, transparently paginating past NetSuite's page size, with configurable concurrent page fetching and optional retry-with-backoff on concurrency-limit errors
 - [x] Parse results into `Column`, `Row`, `Cell` primitives for easy Rust usage
 - [x] Best-effort `describe()` of a query's columns and bind count, without fetching all its rows
 - [x] Create / get / update / replace / delete / upsert records via the REST Record API
@@ -25,7 +25,7 @@ $ cargo add netsuite-rs
 ### Cargo Feature Flags
 ```toml
 # Cargo.toml
-netsuite-rs = { version = "1.0.0", features = ["decimal"] }
+netsuite-rs = { version = "1", features = ["decimal"] }
 ```
 
 - `decimal`: Deserialize numeric cell values into a `bigdecimal::BigDecimal` instead of `f64`. Recommended if you're working with money or need exact precision.
@@ -53,8 +53,10 @@ async fn main() {
         .consumer_secret("CONSUMER_SECRET")
         .token_id("TOKEN_ID")
         .token_secret("TOKEN_SECRET")
-        .pool_size(5usize) // Optional, default 5
-        .page_size(1000)   // Optional, default 1000 (NetSuite's max)
+        .pool_size(5usize)                  // Optional, default 5
+        .page_size(1000)                    // Optional, default 1000 (NetSuite's max)
+        .page_concurrency(3usize)           // Optional, default 3
+        .retry_on_concurrency_limit(false)  // Optional, default false
         .build()
         .unwrap();
 
@@ -101,6 +103,24 @@ async fn main() {
     // ...
 }
 ```
+
+#### Pagination and `page_concurrency`
+
+`.rows()` fetches subsequent pages under the hood using the connection's `page_size`. For a lot of queries a single page's cost is dominated by NetSuite's own query execution time rather than by row count or how deep into the result set you are.
+
+> During my testing, there was identical per-page latency at offset 0 and at offset 90,000 with no change from adding/removing `ORDER BY` or a `WHERE` filter. When that's the bottleneck, fetching pages one at a time just wastes all the wait time instead of overlapping it.
+
+`page_concurrency` (default `3`) controls how many page requests `.rows()` runs concurrently. It doesn't speed up any requests for individual pages but overlapping N of them turns `page_count * page_cost` sequential request time into roughly `(page_count / N) * page_cost`. I guarantee that rows are always yielded in page order regardless of which page's request actually completes first using `FuturesOrdered`.
+
+> Unfortunately, NetSuite enforces a single concurrency limit shared account-wide across *all* REST, SOAP, and RESTlet traffic (not just this driver). This can be as low as 5 concurrent requests on an entry-tier account with no SuiteCloud Plus licenses. `3` is chosen to leave some headroom under that floor. You can check Setup > Integration > Integration Management > Integration Governance for your account's actual limit, and raise it if you have room, or drop it to `1` to go back to fully sequential fetching. Exceeding your account's limit surfaces as an error from whichever page request tripped it, same as any other failed page. (unless `retry_on_concurrency_limit` is configured)
+
+> If a query's per-page execution time itself is the problem (as opposed to not overlapping requests), `page_concurrency` won't fix it. That's a query-shape/NetSuite-execution-cost issue out of this library's control, not a pagination one. Simplifying the query (fewer joins, fewer filter conditions, a simpler `ORDER BY`) is the only thing that reduces that cost.
+
+#### `retry_on_concurrency_limit`
+
+NetSuite's concurrency limit is one pool shared account-wide across *all* REST, SOAP, and RESTlet traffic. That means even a `page_concurrency` comfortably under your account's configured limit can occasionally collide with other activity in your account (like another integration, a scheduled script, someone in the UI) and get rejected with a `CONCURRENCY_LIMIT_EXCEEDED` error.
+
+By default, I reject these requests outright and abort the whole stream. In order words, you lose everything already in progress on what might be a long-running fetch. Setting `.retry_on_concurrency_limit(true)` makes any failed request retry instead, with exponential backoff (500ms, 1s, 2s, 4s, 8s, up to 5 attempts) rather than failing the whole operation. I left it as opt-in because it changes error and timing behavior. (Also maybe you would want to know when you're hitting the concurrency limit)
 
 Bind multiple parameters at once with the `row!` macro:
 

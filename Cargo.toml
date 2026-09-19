@@ -1,7 +1,7 @@
 [package]
 name = "netsuite-rs"
 description = "A lightweight, comprehensive and familiar driver for Oracle NetSuite (SuiteQL + REST Record API) written natively in Rust"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 license = "BSD-3-Clause"
 authors = ["Carl Voller"]
@@ -20,6 +20,8 @@ derive_builder = "0.20"
 futures-util = "0.3"
 async-stream = "0.3"
 async-lock = "3"
+async-io = "2"
+bytes = "1"
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
