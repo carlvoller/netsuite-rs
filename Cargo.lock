@@ -1076,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "netsuite-rs"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "async-io",
  "async-lock",
