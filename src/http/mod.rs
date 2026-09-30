@@ -205,10 +205,17 @@ impl Connection {
             )
             .await?;
 
-        let mut response: SuiteQlResponse = this_errors!(
-            "failed to parse NetSuite response as JSON",
-            serde_json::from_slice(&bytes)
-        );
+        let mut response: SuiteQlResponse = if bytes.iter().all(u8::is_ascii_whitespace) {
+            SuiteQlResponse {
+                items: Vec::new(),
+                total_results: 0,
+            }
+        } else {
+            this_errors!(
+                "failed to parse NetSuite response as JSON",
+                serde_json::from_slice(&bytes)
+            )
+        };
 
         // NetSuite wraps every row with its own HATEOAS "links" envelope field, regardless of
         // what was selected. Strip it so it's never mistaken for a real SQL column.
